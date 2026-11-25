@@ -1,7 +1,8 @@
 -- Kagane. The site moves between mirror domains. The module uses the "Default mirror" setting
--- (kagane.net) and only if that domain is gone does it ask kagane.org for the current mirrors.
+-- (kagane.moe). If that domain is gone, failing or redirecting elsewhere, the last working
+-- fallback is tried, then kagane.org is asked for the current mirrors.
 
-local DEFAULT_MIRROR      = 'kagane.net'
+local DEFAULT_MIRROR      = 'kagane.moe'
 local MIRROR_TRACKER      = 'https://kagane.org/'
 -- Public DNS-over-HTTPS lookup, used to check that a domain still exists before contacting it:
 -- a request to a domain that doesn't resolve throws an exception HDD can't recover from.
@@ -122,7 +123,7 @@ local function NormalizeHost(host)
     return host
 end
 
--- The "Default mirror" setting as a bare host (kagane.net if blank/invalid).
+-- The "Default mirror" setting as a bare host (DEFAULT_MIRROR if blank/invalid).
 local function GetDefaultMirror()
     local setting = module.Settings['Default mirror']
     if not isempty(setting) then
@@ -149,13 +150,32 @@ local function Resolves(host)
     return resolves
 end
 
--- Whether the domain exists and its API answers.
-local function MirrorWorks(host)
-    if not Resolves(host) then return false end
-    local resp = http.GetResponse('https://' .. host .. '/api/v2/config/client')
-    if resp.StatusCode == 200 then return true end
-    Log('Kagane: mirror ' .. host .. ' returned HTTP ' .. tostring(resp.StatusCode))
-    return false
+-- GET without following redirects, so a mirror that forwards to another domain shows up as
+-- a 3xx instead of being followed. Following it would be wrong twice over: a redirected POST
+-- turns into a GET, and the Cloudflare cookies HDD has are for the domain the user browses.
+local function GetResponseNoRedirect(u)
+    local previous = http.AllowAutoRedirect
+    http.AllowAutoRedirect = false
+    local resp = http.GetResponse(u)
+    http.AllowAutoRedirect = previous
+    return resp
+end
+
+-- The mirror's host if the domain exists and its API answers directly, else nil. A mirror
+-- that redirects (e.g. kagane.net -> kagane.moe) counts as not working, so the search moves
+-- on to the saved fallback and kagane.org's list. The redirect target itself can't be used:
+-- HDD returns the Location header of a 3xx response as empty.
+local function CheckMirror(host)
+    if not Resolves(host) then return nil end
+    local resp = GetResponseNoRedirect('https://' .. host .. '/api/v2/config/client')
+    local code = tonumber(tostring(resp.StatusCode)) or 0
+    if code == 200 then return host end
+    if code >= 300 and code < 400 then
+        Log('Kagane: mirror ' .. host .. ' redirects to another domain; set "Default mirror" to the current one')
+    else
+        Log('Kagane: mirror ' .. host .. ' returned HTTP ' .. code)
+    end
+    return nil
 end
 
 -- The mirrors kagane.org currently lists, kept in module.Data for MIRROR_LIST_SECONDS so
@@ -208,24 +228,27 @@ local function GetSiteBase()
     end
 
     local default = GetDefaultMirror()
-    if MirrorWorks(default) then
+    local working = CheckMirror(default)
+    if working then
         module.Data['fallbackMirror'] = ''
-        return use(default)
+        return use(working)
     end
 
     local tried = { default }
     local lastFallback = module.Data['fallbackMirror']
     if IsMirrorHost(tostring(lastFallback)) and lastFallback ~= default then
         table.insert(tried, lastFallback)
-        if MirrorWorks(lastFallback) then return use(lastFallback) end
+        working = CheckMirror(lastFallback)
+        if working then return use(working) end
     end
 
     for _, host in ipairs(GetListedMirrors()) do
         if host ~= default and host ~= lastFallback then
             table.insert(tried, host)
-            if MirrorWorks(host) then
-                module.Data['fallbackMirror'] = host
-                return use(host)
+            working = CheckMirror(host)
+            if working then
+                module.Data['fallbackMirror'] = working
+                return use(working)
             end
         end
     end
@@ -559,8 +582,11 @@ function GetPages()
         error('Kagane: grant response had no access_token: ' .. json.ToString())
     end
 
-    -- Image requests only need the site as Referer (API headers were cleared above).
-    pages.Referer = GetSiteBase() .. '/'
+    -- Image requests need no API headers (cleared above), but the CDN answers 404 unless
+    -- Origin names the site, the way the browser's cross-site fetch sends it.
+    local siteBase = GetSiteBase()
+    pages.Referer = siteBase .. '/'
+    pages.Headers['Origin'] = siteBase
 
     -- The client accepts the manifest either as {"pages": [...]} or as a
     -- bare array. Try the object form first (what the previous API used).
@@ -576,7 +602,8 @@ function GetPages()
         local pageId = page.SelectValue('page_id')
         local ext    = page.SelectValue('ext')
         if not isempty(pageId) and not isempty(ext) then
-            pages.Add(cacheUrl .. '/api/v2/books/page/' .. bookId .. '/' ..
+            -- Same path the site's reader uses; the CDN also still serves it without "original/".
+            pages.Add(cacheUrl .. '/api/v2/books/page/original/' .. bookId .. '/' ..
                       pageId .. '.' .. ext .. '?token=' .. token)
         end
     end
